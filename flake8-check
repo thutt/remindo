@@ -1,0 +1,31 @@
+#!/bin/bash
+# Copyright (c) 2019-2022 Logic Magicians Software
+#
+# Ensures that the script maintains a consistent formatting.
+
+set -o errexit;
+set -o nounset;
+set -o pipefail;
+
+declare -a warnings=(                           \
+        "E129"                                  \
+        "E201"                                  \
+        "E203"                                  \
+        "E221"                                  \
+        "E251"                                  \
+        "E261"                                  \
+        "E272"                                  \
+        "E901"                                  \
+);
+
+function main()
+{
+    local ignored="${warnings[*]}";
+    local flake8="${1:?flake8 was not found on PATH}";
+    shift;
+    if ! "${flake8}" --ignore=${ignored// /,} ./remindo; then
+        echo "flake8 failed.";
+    fi;
+}
+
+main $(which flake8) "${@}";

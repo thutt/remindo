@@ -1,0 +1,585 @@
+#!/usr/bin/python
+# Copyright (c) 2019-2022 Logic Magicians Software
+#
+# Released under GPLv3.
+import argparse
+import datetime
+import os
+import re
+import sys
+import textwrap
+import traceback
+
+
+def fatal(msg):
+    print("fatal: %s" % (msg))
+    sys.exit(1)
+
+
+def warning(msg):
+    print("warning: %s" % (msg))
+
+
+def configure_parser():
+    description = ("""
+
+This program is a simple TODO list management tool.  When run, it
+reads data files describing upcoming work, then prints items that are
+'due' and 'overdue' to the console.
+
+An item is 'due' if it occurs within the next three (3) days
+(configurable with '--days').  An item is overdue if it has been
+assigned specific date, is not marked as completed, and the date has
+passed.
+
+The initial data file is stored at ~/.reminders/reminders, though this
+can be overridden with '--initial-data-file'.
+
+The EBNF of the data file is this:
+
+  Reminders := (Comment | Include | DataLine)...
+
+  Comment   := Line beginning with '#'
+               Blank line
+
+  Include   := 'include' FileName
+  FileName  := name of a file that is in ~/.reminders
+
+  DataLine  := Priority ' ' Date ' ' Reminder
+
+  Priority  := integer from 0-9.
+  Date      := CalDate | DayOfWeek
+
+  CalDate   := Year '.' Month '.' MonthDay
+  Year      := SpecYear | WildYear
+  Month     := SpecMonth | WildMonth
+  MonthDay  := SpecDay | WildDay
+  SpecYear  := 2{0-1}{0-9}{0-9}
+  WildYear  := ????
+  SpecMonth := {0-9}{0-9}
+  WildMonth := ??
+  SpecDay   := {0-9}{0-9}
+  WildDay   := ??
+
+  DayOfWeek := Days ['%' WeekMod | '[' N-TH ']']
+  Days      := ('S' | '-)('M' | '-')('T' | '-')
+                  ('W' | '-')('T' | '-')('F' | '-')('S' | '-')
+  WeekMod   := 1..53
+  N-TH      := 1..5
+
+
+Notes:
+
+  o Overdue items are marked with '*' to the left of the priority.
+
+  o Wildcard dates are never overdue.
+
+  o Overdue items are placed at the top of the output.
+
+  o The 'CalDate' format describes a specific calendar date.
+
+     For example, a high priority task for Janurary 1, 2020:
+
+        1 2020.01.01 Release remindo
+
+  o The 'DayOfWeek' format describes one or more days in a week.
+
+     For example, a medium priority task occurring every other
+     Tuesday, between 8 AM and 9AM:
+
+        3 --T----%2:0800-0900 Check status of defects filed against UI team.
+
+  o Items with a CalDate format will be displayed for a specifc
+     calendar date, and will be marked overdue in the list when the
+     calendar date has passed.
+
+  o The WeekMod format is used to make items repeat on a cadence.  The
+     modulus is applied to the ISO 8601 week number.
+
+     A modulus of '1' will cause the entry to repeat each week.  A
+     modulus of '2' would cause the entry to repeat every two weeksa.
+     A missing WeekMod implies a WeekMod of 1.
+
+     For details on ISO 8601, see man strftime, and look at the
+     description for '%V'.
+
+  o DayOfWeek formatted lines that are attributed with an 'N-TH' value
+     will be displayed on that day-of-week occurrence each month.
+     '-M-----[2]' will display on the second monday of every month.
+
+  o The order of reminders output is as follows:
+
+     ~/.reminders/reminders (or the file specified with --initial-data-file).
+     reminders in include files, in included order
+
+  o A handy way to run in an xterm:
+
+        watch --interval=600 reminders
+
+For a sampling using the demo files included in the distribution:
+
+  remindo --initial-data-file <path where this software is checked-out>/remindo
+
+Return Code:
+  0       : success
+  non-zero: failure
+""")
+
+    formatter = argparse.RawDescriptionHelpFormatter
+    parser    = argparse.ArgumentParser(usage           = None,
+                                        formatter_class = formatter,
+                                        description     = description,
+                                        prog            = "reminders")
+
+    o = parser.add_argument_group("Output Options")
+    o.add_argument("--verbose",
+                   help    = ("Turns on verbose diagnostic output"),
+                   action  = "store_true",
+                   default = False,
+                   dest    = "arg_verbose")
+
+    # Increasing the allowed lookahead will cause tricky issues with
+    # recurring (weekly) items due to 'modulo' and 'nth' notations.
+    o.add_argument("--days",
+                   help    = "Days for reminders",
+                   type    = int,
+                   action  = "store",
+                   default = 3,
+                   choices = range(0, 7), # up to 1 week lookahead
+                   dest    = "arg_days")
+
+    o.add_argument("--limit",
+                   help    = "Limit lines of output from each loaded file",
+                   action  = "store",
+                   default = None,
+                   dest    = "arg_limit")
+
+    o.add_argument("--idf", "--initial-data-file",
+                   help    = "Override for ~/.reminders/reminders",
+                   action  = "store",
+                   default = None,
+                   dest    = "arg_data_file")
+
+    parser.add_argument("tail",
+                        help  = "Command line tail",
+                        nargs = "*")
+    return parser
+
+
+def read_data(options, pathname):
+    if os.path.exists(pathname):
+        # Read json data from reminders file
+        key         = os.path.basename(pathname)
+        order       = [key]
+        result      = { }
+        result[key] = []
+        continuing  = False
+        try:
+            with open(pathname) as fp:
+                for l in fp:
+                    l = l.replace('\n', '').strip()
+                    if len(l) > 0 and not l.startswith('#'):
+                        if l.startswith("include"):
+                            (directive, pathname) = l.split(' ')
+                            include_file = os.path.join(options.data_directory,
+                                                        pathname.strip())
+                            (included, incl_order) = read_data(options,
+                                                               include_file)
+                            if included is not None:
+                                # If the file was not found, ignore
+                                result = dict(result.items() +
+                                              included.items())
+                                order += incl_order
+                        else:
+                            end_in_backslash = l.endswith(" \\")
+                            if end_in_backslash:
+                                # This line starts a multi-line.
+                                # Remove trailing '\'.
+                                l = l[:-1]
+                            if continuing:
+                                # Continuation.  Append to last line read.
+                                i = len(result[key]) - 1
+                                v = result[key][i]
+                                result[key][i] = "%s%s" % (v, l)
+                            else:
+                                result[key].append(l)
+                            continuing = end_in_backslash
+
+            return (result, order)
+        except:
+            warning("Unable to read '%s'" % (pathname))
+            return (None, None)
+    else:
+        warning("File '%s' does not exist" % (pathname))
+        return (None, None)
+
+
+def nth_occurrence_in_month(options, dow, nth):
+    # dow = index to [ SMTWRFS ]
+    lo = 1 + (nth - 1) * 7
+    hi = lo + 6                   # [lo, hi], not [lo, hi)
+
+    today_dom = datetime.date.today().day # day of month
+    return today_dom >= lo and today_dom <= hi
+
+
+def is_time_past(time):
+    # 'time' is a string of 24-hour format time: "0948"
+    now = datetime.datetime.now()
+    result = int(time) < (now.hour * 100 + now.minute)
+    return result
+
+
+def default_processed_data(priority, date, beg, end, reminder, raw):
+    return {
+        'overdue'  : False,
+        'open'     : True,
+        'priority' : priority,
+        'date'     : date,
+        'beg'      : beg,        # start time
+        'end'      : end,        # end time
+        'reminder' : reminder,
+        'raw'      : raw,
+    }
+
+
+def _pending_date_line(options, processed):
+    year  = processed['year']
+    month = processed['month']
+    day   = processed['day']
+    if processed['wildcard']:
+        today = datetime.date.today()
+        if processed['year'] == '????':
+            year = today.year
+
+        if processed['month'] == '??':
+            month = today.month
+
+        if processed['day'] == '??':
+            day = today.day
+
+    date = datetime.date(int(year), int(month), int(day))
+    beg  = processed['beg']
+    end  = processed['end']
+
+    assert(beg is None or end is not None)
+    assert(end is None or beg is not None)
+
+    time_past = end is not None and is_time_past(end)
+
+    processed['overdue']  = (not processed['wildcard'] and
+                             (date < options.start_date or
+                              (date == datetime.datetime.today().date() and
+                               time_past)))
+    if (processed['overdue'] or
+        (date >= options.start_date and
+         date <= options.start_date + options.days_delta)):
+        return True
+
+    return False
+
+
+def _parse_date_line(options, line, groups):
+    beg = groups[5]
+    end = groups[6]
+    if beg is not None:
+        beg = int(beg)
+    if end is not None:
+        end = int(end)
+
+    base = default_processed_data(groups[0],                # priority
+                                  "%s.%s.%s" % (groups[1],  # date
+                                                groups[2],
+                                                groups[3]),
+                                  beg,                      # begin time
+                                  end,                      # end time
+                                  groups[7],                # reminder
+                                  line)                     # raw line
+    ext = {
+        'year'     : groups[1],
+        'month'    : groups[2],
+        'day'      : groups[3],
+        'wildcard' : (groups[1] == "????" or
+                      groups[2] == "??"   or
+                      groups[3] == "??")
+    }
+    return dict(base.items() + ext.items())
+
+
+def _pending_week_line(options, processed):
+    dow  = processed['days']  # days of week
+    mod  = processed['mod']   # ISO week modulus
+    nth  = processed['index'] # nth occurrence of day in month
+    beg  = processed['beg']
+    end  = processed['end']
+
+    if beg is not None:
+        assert(end is not None)
+
+    if end is not None:   # end time
+        assert(beg is not None)
+        if is_time_past(end):
+            # This is recurring meeting.  It's past the time for the
+            # meeting on the current day, so stop showing it.
+            #
+            return False
+
+    # Lookahead for a recurring item.  This is tricky.
+    #
+    # Looking ahead more than one week will normally yield the same
+    # results, so an upper bound of 7 days could be used.  However,
+    # 'nth' occurrence and 'modulo' notation make this imprecise.
+    #
+    # For simplicity, never allow lookahead to be more than one week.
+    #
+    assert(int(options.arg_days) < 7)
+    today       = datetime.date.today().weekday() # day of week [Mo=0, Su=6]
+    i           = today
+    iend        = (today + int(options.arg_days)) % 7
+    nth_enabled = mod is None and nth is not None
+    mod_enabled = mod is not None and nth is None
+
+    while i != iend:
+        if dow[i]:            # dow[7] of bool
+            if (mod_enabled and options.iso_week % mod == 0):
+                return True
+            elif (nth_enabled and
+                  i == today  and
+                  nth_occurrence_in_month(options, i, nth)):
+                return True
+            elif not mod_enabled and not nth_enabled:
+                return True
+        i = (i + 1) % 7
+
+    return False
+
+
+def _parse_week_line(options, line, groups):
+    beg   = groups[13]
+    end   = groups[14]
+    mod   = groups[10]
+    index = groups[11]
+
+    if beg is not None:
+        beg = int(beg)
+    if end is not None:
+        end = int(end)
+    if mod is not None:
+        mod = int(mod)
+    if index is not None:
+        index = int(index)
+
+    base = default_processed_data(groups[0],               # priority
+                                  groups[1],               # date
+                                  beg,                     # begin time
+                                  end,                     # end time
+                                  groups[15].strip(),      # reminder
+                                  line)                    # raw line
+
+    ext = {
+        'wildcard' : False,
+        # [3:10] is the individual days of the week
+        'days'     : [groups[3] != '-', # Monday
+                      groups[4] != '-',
+                      groups[5] != '-',
+                      groups[6] != '-',
+                      groups[7] != '-',
+                      groups[8] != '-',
+                      groups[2] != '-'],
+        'mod'      : mod,
+        'index'    : index
+    }
+    return dict(base.items() + ext.items())
+
+
+def get_pending(options, fname, reminders):
+    # reminders is a list of raw data from a data file.
+    pending = []
+    for r in reminders:
+        line_matched = False
+        for p in options.parsers:
+            matched = p['RE'].match(r)
+            if matched:
+                line_matched = True
+                pd = p['PARSER'](options, r, matched.groups())
+                if (pd is not None and
+                    pd['open']     and
+                    p['PENDING'](options, pd)):
+                    pending.append(pd)
+                break               # cannot match any other parser.
+        if not line_matched:
+            warning("%s[%s]: malformed line" % (fname, r))
+    return pending
+
+
+def canonical_date(date):
+    if date[0] not in "0123456789":
+        # A date of the form 'YYYY.MM.DD' will sort as desired.  A
+        # week-style ('SMTWTFS') date will not sort properly with
+        # numerical dates.  A displayed week-style date must be valid
+        # 'today'.  Return today's date for them for sorting.
+        today = datetime.date.today()
+        return "%4.4d.%2.2d.%2.2d" % (today.year, today.month, today.day)
+    return date
+
+
+def sort_items_to_display(k):
+    if k['overdue']:
+        # Overdue items are sorted by priority first, then date.  This
+        # puts the highest priority overdue items first in the list.
+        #
+        return (not k['overdue'],
+                canonical_date(k['date']),
+                k['priority'],
+                k['beg'])
+    else:
+        # Pending, but not overdue items, are sorted by date first,
+        # then priority.  When looking ahead more than one day, this
+        # sort causes due-dates to be clumped together, and ordered by
+        # priority.
+        #
+        return (not k['overdue'],
+                canonical_date(k['date']),
+                k['priority'],
+                k['beg'])
+
+
+def process_reminders(options):
+    if options.data_file is None:
+        fatal("A data file must be specified")
+
+    if os.path.exists(options.data_file):
+        (reminders, order) = read_data(options, options.data_file)
+    else:
+        fatal("'%s' does not exist" % (options.data_file))
+
+    for fname in order:
+        limit   = 0
+        pending = get_pending(options, fname, reminders[fname])
+        if len(pending) > 0:
+            print("[%s]" % (fname))
+            for r in sorted(pending, key = sort_items_to_display):
+                if (options.arg_limit is not None and
+                    limit >= int(options.arg_limit)):
+                    print("  limit exceeded (%d)" % (int(options.arg_limit)))
+                    break
+                limit += 1
+
+                date    = r['date']
+                beg     = r['beg']
+                end     = r['end']
+                prio    = r['priority']
+                data    = r['reminder']
+                overdue = r['overdue']
+                text    = textwrap.wrap(data.strip(), 100 -
+                                        (2 + # extra line leading spaces
+                                         2 + 2 + 2 + 10 + 2 + 9 + 2))
+
+                if beg is not None and end is not None:
+                    time_range = "%4.4d-%4.4d" % (beg, end)
+                else:
+                    time_range = " "
+
+                if overdue:
+                    late = "*"
+                else:
+                    late = " "
+
+                print("%-2s%-2s%-2s%-10s%2s%9s%2s%s" %
+                      (" ", late, str(prio),
+                       str(date).strip(), " ",
+                       time_range, " ",
+                       text[0]))
+                for l in text[1:]:
+                    print("  %-2s%-2s%-2s%-10s%2s%9s%2s%s" %
+                          (" ", " ", " ", " ", " ", " ", " ", l))
+
+            print
+
+
+def line_weekly_date_re():
+    return (r'^'
+            '([0-9])\s+'                             # priority
+            '((S|-)(M|-)(T|-)(W|-)(T|-)(F|-)(S|-))' # days
+            '('
+            '\%([0-9]+)|'                            # week modulus
+            '\[([1-5])\]|'                           # n-th occurrence in month
+            ')'
+            '?'                                       # 0 or 1 modulus or n-th
+            '(:([0-9][0-9][0-9][0-9])'              # start time
+            '-([0-9][0-9][0-9][0-9]))*'             # end time
+            '\s+'
+            '(.+)'                                    # reminder text
+            '$')
+
+
+def line_specific_date_re():
+    return (r'^'
+            '([0-9])\s+'                             # priority
+            '(2[0-1][0-9][0-9]|\?\?\?\?)\.'         # year
+            '([0-9][0-9]|\?\?)\.'                    # month
+            '([0-9][0-9]|\?\?)'                      # day
+            '(:([0-9][0-9][0-9][0-9])'              # start time
+            '-([0-9][0-9][0-9][0-9]))*\s+'          # end time
+            '(.+)'                                    # reminder text
+            '$')
+
+
+def make_parser(regex, parser, pending):
+    result            = {}
+    result['RE']      = re.compile(regex)
+    result['PARSER']  = parser
+    result['PENDING'] = pending
+    return result
+
+
+def initialize_options(options):
+    options.start_date = datetime.date.today()
+    options.days_delta = datetime.timedelta(days = int(options.arg_days))
+
+    options.parsers = []
+    options.parsers.append(make_parser(line_specific_date_re(),
+                                       _parse_date_line,
+                                       _pending_date_line))
+    options.parsers.append(make_parser(line_weekly_date_re(),
+                                       _parse_week_line,
+                                       _pending_week_line))
+
+    # Set current week number for WeekMod events
+    iso = datetime.date.today().isocalendar()
+    options.iso_week = iso[1]
+
+    # Set data directory and initial data file.
+    home = os.environ.get('HOME')
+    assert(home is not None)
+    if options.arg_data_file is None:
+        options.data_directory = os.path.join(home, ".reminders")
+        options.data_file = os.path.join(options.data_directory, "reminders")
+    else:
+        options.data_directory = os.path.dirname(options.arg_data_file)
+        options.data_file = options.arg_data_file
+
+
+def main():
+    try:
+        parser  = configure_parser()
+        options = parser.parse_args()
+
+        initialize_options(options)
+        process_reminders(options)
+
+    except KeyboardInterrupt:
+        sys.exit(0)
+
+    except Exception as e:
+        print("internal error: unexpected exception\n%s" % str(e))
+        if options.arg_verbose:
+            print("")
+            print(traceback.format_exc())
+        else:
+            print("Re-run with --verbose to get details")
+
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
