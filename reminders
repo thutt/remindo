@@ -1,0 +1,41 @@
+include holidays
+
+# All day, on Jan 1, 2020.
+# Will always show as 'overdue'.  Remove to no longer display.
+1 2000.01.01 Release remindo
+
+# All day, every other Friday.
+0 -----F-%2:0000-2359 Payday
+
+# 8pm to midnight, every other Friday.
+3 -----F-%2:2000-2359 Spend paycheck
+
+# All day, every other Saturday.
+3 ------S%2:0000-2359 Spend paycheck
+
+# 15th of every month.
+7 ????.??.15 Pay rent
+
+# Second Wednesday of every month.
+9 ---W---[2]:0930-1000 1:1 with manager
+
+# Every other Tuesday between 8AM and 9AM.
+3 --T----%2:0800-0900 Check status of defect tickets filed against other teams.
+
+# On the 23rd of every month, be reminded to ping a ticket that is not
+# being fixed.
+5 ????.??.23 Don't forget ticket 123456 has not been fixed in months; ping it.
+
+# Every workday, every seventh week, be reminded to ping
+# a different ticket that is not being fixed.
+#
+5 -MTWTF-%7  Don't forget ticket 123458 has not been fixed in months; ping it.
+
+# On July 28, every year, be sure to renew the domain.
+3 ????.07.28 Renew domain.
+
+0 -MTWT--:1700-2359 Pau Hana Time
+0 -----F-:1700-2359 Decompress, the work week is over.
+9 -MTWTF-:0900-1659 Work time!
+0 S-----S:0000-2359 Weekend time!
+
